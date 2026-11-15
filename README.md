@@ -14,13 +14,13 @@ Broken access control is OWASP #1 and the one category an LLM reading files is w
 | `DELETE /api/projects/:id` | 🔴 | ✓ | `—` |
 | `GET /api/billing` | ✓ | ✓ | `—` |
 | `GET /debug/dump` | ✓ | ✓ | `—` |
+| `POST /login` | ✓ | ✓ | `—` |
 | `GET /api/admin/users` | · | ✓ | `requireAuth` |
 | `POST /api/admin/users/:id/promote` | · | ✓ | `requireAuth` |
 | `GET /api/projects` | · | own | `requireAuth` |
 | `POST /api/projects` | · | own | `requireAuth` |
 | `GET /api/projects/:id` | · | ✓ | `requireAuth` |
 | `PATCH /api/projects/:id` | · | ✓ | `getServerSession` |
-| `POST /login` | ✓ | ✓ | `—` |
 
 <sub>🔴 reachable by anyone and it writes · ✓ reachable · `own` scoped to the caller's own rows · `·` blocked. Two columns because this codebase has no role guard anywhere — that is the finding, not an omission in the table.</sub>
 
