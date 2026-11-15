@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""Find every route a codebase exposes, and resolve what guards it.
+
+Reads route definitions for Express-style routers, the Next.js App Router
+(including server actions), FastAPI, Flask and Laravel, then resolves each
+route's guard chain to one of four levels: public, authed, role, owner.
+
+Nothing is asserted that is not shown: every guard carries the file and line it
+was resolved from, and a route with no guard is reported as "no guard found"
+rather than as a vulnerability.
+
+Standard library only.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+
+SKIP_DIRS = {
+    ".git", "node_modules", "vendor", "dist", "build", "out", ".next", ".nuxt",
+    "__pycache__", ".venv", "venv", "env", ".tox", "coverage", ".cache",
+    "target", ".idea", ".vscode", "bower_components", ".svelte-kit",
+    "storage", "migrations", "tests", "test", "__tests__", "spec",
+}
+JS_EXT = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+PY_EXT = {".py"}
+PHP_EXT = {".php"}
+CODE_EXT = JS_EXT | PY_EXT | PHP_EXT
+MAX_BYTES = 1_500_000
+
+METHODS = ("get", "post", "put", "patch", "delete", "options", "head", "all")
+MUTATING = {"POST", "PUT", "PATCH", "DELETE", "ALL"}
+
+# ---- guard vocabularies -------------------------------------------------
+
+IDENTITY = re.compile(
+    r"\b(require_?auth\w*|requires_?login|is_?authenticated|authenticate\w*|"
+    r"ensure_?logged_?in|login_?required|auth_?required|with_?auth|"
+    r"get_?server_?session|current_?user|get_?current_?user|verify_?token|"
+    r"verify_?jwt|check_?auth|auth_?middleware|protect\w*|passport|"
+    r"session_?required|jwt_?required|token_?required|must_?be_?logged_?in|"
+    r"clerk_?middleware|get_?session|auth_?guard|signed_?in)\b", re.I
+)
+ROLE = re.compile(
+    r"\b(require_?admin|is_?admin|has_?role|require_?role|roles?_?required|"
+    r"authorize\w*|authorise\w*|can_?access|has_?permission|require_?permission|"
+    r"permission_?required|check_?role|admin_?only|ensure_?admin|gate|ability|"
+    r"restrict_?to)\b", re.I
+)
+ROLE_ARG = re.compile(
+    r"(?:role|roles|permission|ability|can|authorize|restrict_?to|middleware)"
+    r"\s*[:(\[]?\s*['\"]([\w.:|-]+)['\"]", re.I
+)
+RATE_LIMIT = re.compile(
+    r"(\brate_?limit\w*|\w*throttle\w*|\w*limiter\b|\bslow_?down\b|"
+    r"\bratelimit\w*|\btoken_?bucket\b)", re.I
+)
+CSRF = re.compile(r"\b(csrf|xsrf|same_?site|double_?submit)\b", re.I)
+
+# Middleware declared as a string: Laravel's ->middleware('auth'), Flask-style
+# lists, FastAPI dependency names. Anchored, so a path never matches by accident.
+MW_IDENTITY = re.compile(
+    r"^(auth|auth\.\w+|auth:[\w,.-]+|sanctum|jwt|jwt\.auth|jwt_?auth|verified|"
+    r"signed|session|authenticated|protected|guest|web)$", re.I
+)
+MW_ROLE = re.compile(
+    r"^(role|roles|admin|is_?admin|superuser|staff)(?::[\w,.|-]+)?$|"
+    r"^(can|permission|permissions|ability|abilities|scope|scopes)"
+    r"(?::[\w,.|-]+)?$", re.I
+)
+
+# Where identity comes from. A value the caller passed in is not identity.
+SESSION_SOURCE = re.compile(
+    r"\b(?:req|request|ctx|context|locals|event)\.user\b|"
+    r"\bsession\s*[.?\[]|\bsession\.user\b|\bgetServerSession\b|"
+    r"\bcurrent_?user\b|\bauth\s*\(\s*\)|\bauth\.user\b|"
+    r"\bgetUser\s*\(|\buseUser\s*\(|\bme\.id\b|\bclerk\w*\b|"
+    r"\brequest\.user\b|\$request->user\s*\(|\bauth\(\)->", re.I
+)
+# An ownership check compares the row's owner against the session identity.
+OWNER_FIELD = re.compile(
+    r"\b(?:user|owner|author|account|creator|tenant|org|organisation|organization)"
+    r"_?id\b|\bbelongs_?to\b|\bscoped_?to_?user\b|\bfor_?user\b", re.I
+)
+
+
+def _owner_check(line: str) -> bool:
+    """True only when an owner field is constrained by a session identity."""
+    if not SESSION_SOURCE.search(line):
+        return False
+    if OWNER_FIELD.search(line):
+        return True
+    # filter(user=request.user) / ->where('user_id', auth()->id())
+    if re.search(
+        r"\bfilter\s*\([^)]{0,120}\buser\s*=|"
+        r"->where\s*\(\s*['\"](?:user_?id|owner_?id)['\"]", line, re.I
+    ):
+        return True
+    # where: { id: session.user.id } -- the row is addressed by the caller's own id
+    return bool(re.search(
+        r"\b(?:where|filter)\b[^;]{0,160}:\s*[\w.$>-]*"
+        r"(?:session|req\.user|request\.user|current_?user|auth\(\))[\w.$>-]*",
+        line, re.I,
+    ))
+MUTATOR_CALL = re.compile(
+    r"\.(create|createMany|update|updateMany|upsert|delete|deleteMany|destroy|"
+    r"save|insert|remove|bulkWrite|findOneAndUpdate|findOneAndDelete)\s*\(|"
+    r"\b(INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b", re.I
+)
+BODY_SPREAD = re.compile(
+    r"\.{3}\s*(?:req|request)\.(?:body|data|json)|"
+    r"\.{3}\s*(?:body|data|input)\b|"
+    r"\*\*\s*(?:request\.|req\.)?(?:json|data|body|payload)\b|"
+    r"\$request->all\(\)|\$request->except\(|Object\.assign\s*\([^,]+,\s*"
+    r"(?:req|request)\.body", re.I
+)
+CLIENT_ROLE = re.compile(
+    r"(?:req|request)\.(?:body|query|params|headers|args|form|get_json\(\))"
+    r"[\[.]{1,2}['\"]?(role|roles|is_?admin|admin|permission|scope|tier|plan)\b|"
+    r"\$request->(?:input|get|query)\s*\(\s*['\"](role|is_?admin|admin|permission)",
+    re.I,
+)
+SENSITIVE = re.compile(
+    r"\b(user|users|account|accounts|payment|payments|invoice|invoices|card|"
+    r"subscription|credential|secret|token|session|order|orders|customer|"
+    r"customers|member|members|employee|patient|ssn|salary)\b", re.I
+)
+DEBUG_PATH = re.compile(
+    r"/(debug|test|tests|__|internal|dev|dump|console|admin-?tools|phpinfo|"
+    r"seed|migrate|reset|backup|export-?all|graphiql|playground)\b", re.I
+)
+AUTH_PATH = re.compile(
+    r"/(login|signin|sign-?in|signup|sign-?up|register|password|reset|forgot|"
+    r"otp|verify|token|refresh|magic-?link|2fa|mfa)\b", re.I
+)
+
+
+def walk(root: str) -> list:
+    out = []
+    if os.path.isfile(root):
+        base = os.path.dirname(os.path.abspath(root)) or "."
+        files = [(os.path.basename(root), os.path.abspath(root))]
+    else:
+        base = os.path.abspath(root)
+        files = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = sorted(
+                d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
+            )
+            for fn in sorted(filenames):
+                if os.path.splitext(fn)[1].lower() in CODE_EXT:
+                    full = os.path.join(dirpath, fn)
+                    files.append((os.path.relpath(full, base), full))
+    for rel, full in files:
+        try:
+            if os.path.getsize(full) > MAX_BYTES:
+                continue
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        out.append((rel.replace(os.sep, "/"), full, lines))
+    return out
+
+
+def strip_comment(line: str) -> str:
+    for marker in ("//", "#"):
+        idx = line.find(marker)
+        while idx != -1:
+            before = line[:idx]
+            if before.count("'") % 2 == 0 and before.count('"') % 2 == 0:
+                return before
+            idx = line.find(marker, idx + 1)
+    return line
+
+
+def body_of(lines: list, start: int, limit: int = 120) -> list:
+    """Lines of the handler that begins at or just after `start`."""
+    depth = 0
+    seen_open = False
+    out = []
+    for i in range(start, min(len(lines), start + limit)):
+        line = lines[i]
+        out.append((i, line))
+        depth += line.count("{") - line.count("}")
+        if "{" in line:
+            seen_open = True
+        if seen_open and depth <= 0 and i > start:
+            break
+    return out
+
+
+def py_body(lines: list, start: int, limit: int = 120) -> list:
+    """Lines of a Python function defined at or after `start`."""
+    out = []
+    indent = None
+    for i in range(start, min(len(lines), start + limit)):
+        line = lines[i]
+        if indent is None:
+            if re.match(r"\s*(async\s+)?def\s", line):
+                indent = len(line) - len(line.lstrip())
+                out.append((i, line))
+            continue
+        if not line.strip():
+            out.append((i, line))
+            continue
+        if len(line) - len(line.lstrip()) <= indent:
+            break
+        out.append((i, line))
+    return out
+
+
+def classify(tokens: list) -> tuple:
+    """Turn guard tokens into (level, roles). Highest wins."""
+    level, roles = "public", []
+    for t in tokens:
+        # guard_tokens already decided what this is; do not re-litigate the name
+        if t.get("kind") == "role" or ROLE.search(t["name"]):
+            level = "role"
+            roles += t.get("roles", [])
+        elif level != "role":
+            level = "authed"
+    return level, sorted(set(roles))
+
+
+def guard_tokens(text: str, file: str, line: int, via: str) -> list:
+    """Every guard-looking identifier on a line, with what it is."""
+    found = []
+    for m in re.finditer(r"[A-Za-z_][\w.:\\-]*", text):
+        word = m.group(0)
+        if ROLE.search(word):
+            roles = [r for r in ROLE_ARG.findall(text)]
+            found.append({
+                "name": word, "kind": "role", "roles": roles,
+                "file": file, "line": line, "via": via,
+            })
+        elif IDENTITY.search(word):
+            found.append({
+                "name": word, "kind": "identity", "roles": [],
+                "file": file, "line": line, "via": via,
+            })
+    # `->middleware('auth')` and `middleware=['role:admin']` carry the guard in a string
+    for lit in re.findall(r"['\"]([\w.:|,-]+)['\"]", text):
+        is_role = bool(MW_ROLE.match(lit)) or bool(ROLE.search(lit))
+        is_identity = bool(MW_IDENTITY.match(lit)) or bool(IDENTITY.search(lit))
+        if not (is_role or is_identity):
+            continue
+        roles = []
+        if ":" in lit:
+            roles = [x for part in lit.split(":")[1:] for x in part.split(",") if x]
+        elif is_role and lit.lower() in {"admin", "staff", "superuser"}:
+            roles = [lit.lower()]
+        found.append({
+            "name": lit, "kind": "role" if is_role else "identity",
+            "roles": roles, "file": file, "line": line, "via": via,
+        })
+    return found
+
+
+RE_IMPORT = re.compile(
+    r"import\s+(?:(\w+)|\{[^}]*\})\s*(?:,\s*\{[^}]*\}\s*)?from\s*['\"]([^'\"]+)['\"]"
+)
+RE_REQUIRE = re.compile(r"(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(\s*['\"]([^'\"]+)['\"]")
+RE_MOUNT = re.compile(
+    r"\b\w+\s*\.\s*use\s*\(\s*[`'\"]([^`'\"]+)[`'\"]\s*,\s*([\w, ]+?)\s*\)"
+)
+
+
+def _resolve(spec: str, from_rel: str, known: set) -> str:
+    """./routes/projects from src/server.ts -> src/routes/projects.ts"""
+    if not spec.startswith("."):
+        return ""
+    base = os.path.normpath(os.path.join(os.path.dirname(from_rel), spec))
+    base = base.replace(os.sep, "/")
+    for cand in [base] + [base + e for e in sorted(JS_EXT)] + [
+        base + "/index" + e for e in sorted(JS_EXT)
+    ]:
+        if cand in known:
+            return cand
+    return ""
+
+
+def mount_map(files: list) -> dict:
+    """{file: url prefix} for routers mounted with app.use('/prefix', router)."""
+    known = {rel for rel, _f, _l in files}
+    direct = {}
+    for rel, _full, lines in files:
+        if os.path.splitext(rel)[1].lower() not in JS_EXT:
+            continue
+        imports = {}
+        for raw in lines:
+            for m in list(RE_IMPORT.finditer(raw)) + list(RE_REQUIRE.finditer(raw)):
+                if m.group(1):
+                    imports[m.group(1)] = m.group(2)
+        for raw in lines:
+            for m in RE_MOUNT.finditer(strip_comment(raw)):
+                prefix = m.group(1)
+                for ident in [x.strip() for x in m.group(2).split(",")]:
+                    spec = imports.get(ident)
+                    if not spec:
+                        continue
+                    target = _resolve(spec, rel, known)
+                    if target:
+                        direct[target] = (prefix, rel)
+    # a mounted router may itself be mounted; fold the chain in
+    out = {}
+    for target in direct:
+        prefix, parent = direct[target], None
+        chain, cur, seen = [], target, set()
+        while cur in direct and cur not in seen:
+            seen.add(cur)
+            pfx, parent = direct[cur]
+            chain.insert(0, pfx.strip("/"))
+            cur = parent
+        out[target] = "/" + "/".join(p for p in chain if p)
+    return out
+
+
+def route(method, path, file, line, handler="", guards=None, kind="route") -> dict:
+    path = "/" + (path or "").strip("/")
+    return {
+        "method": method.upper(),
+        "path": path or "/",
+        "file": file,
+        "line": line,
+        "handler": handler,
+        "kind": kind,
+        "guards": guards or [],
+        "params": re.findall(r"[:{\[](\w+)[}\]]?", path),
+        "mutating": method.upper() in MUTATING,
+        "owner_check": False,
+        "session_source": False,
+        "enforces": False,
+        "caller_identity_param": False,
+        "mass_assignment": False,
+        "client_role": False,
+        "touches_sensitive": False,
+        "guard_after_write": False,
+        "rate_limited": False,
+        "body_lines": [],
+    }
+
+
+CALLER_IDENTITY = re.compile(
+    r"\b(user_?id|account_?id|owner_?id|customer_?id|tenant_?id|org_?id|"
+    r"member_?id|actor_?id)\b\s*[,:)=]", re.I
+)
+
+
+ENFORCE = re.compile(
+    r"\b401\b|\b403\b|unauthorised|unauthorized|forbidden|\bthrow\b|"
+    r"\bredirect\s*\(|\babort\s*\(|\bnotFound\s*\(|HTTPException|"
+    r"\bdeny\b|\breject\b", re.I
+)
+
+
+def inspect_body(r: dict, body: list) -> None:
+    """Read the handler for ownership checks, mass assignment and ordering."""
+    first_write, first_identity = None, None
+    if body:
+        sig = " ".join(l for _, l in body[:3])
+        if CALLER_IDENTITY.search(sig.split("{", 1)[0] if "{" in sig else sig):
+            r["caller_identity_param"] = True
+    for i, raw in body:
+        line = strip_comment(raw)
+        if not line.strip():
+            continue
+        if SESSION_SOURCE.search(line):
+            r["session_source"] = True
+        if ENFORCE.search(line):
+            r["enforces"] = True
+        if _owner_check(line):
+            r["owner_check"] = True
+            r.setdefault("owner_evidence", {"file": r["file"], "line": i + 1,
+                                            "snippet": line.strip()[:140]})
+        if BODY_SPREAD.search(line):
+            r["mass_assignment"] = True
+            r.setdefault("mass_evidence", {"file": r["file"], "line": i + 1,
+                                           "snippet": line.strip()[:140]})
+        if CLIENT_ROLE.search(line):
+            r["client_role"] = True
+            r.setdefault("client_role_evidence", {"file": r["file"], "line": i + 1,
+                                                  "snippet": line.strip()[:140]})
+        if SENSITIVE.search(line) and MUTATOR_CALL.search(line):
+            r["touches_sensitive"] = True
+        if RATE_LIMIT.search(line):
+            r["rate_limited"] = True
+        if MUTATOR_CALL.search(line) and first_write is None:
+            first_write = i
+        if IDENTITY.search(line) and first_identity is None:
+            first_identity = i
+            if not any(g["via"] == "body" for g in r["guards"]):
+                r["guards"] += guard_tokens(line, r["file"], i + 1, "body")
+        elif ROLE.search(line):
+            r["guards"] += guard_tokens(line, r["file"], i + 1, "body")
+    if first_write is not None and first_identity is not None and first_identity > first_write:
+        r["guard_after_write"] = True
+        r["guard_order_evidence"] = {
+            "file": r["file"], "write_line": first_write + 1,
+            "check_line": first_identity + 1,
+        }
+    if body:
+        r["body_lines"] = [body[0][0] + 1, body[-1][0] + 1]
+
+
+# --------------------------------------------------------------------------
+# Express / Fastify / Koa-style routers
+# --------------------------------------------------------------------------
+
+RE_EXPRESS = re.compile(
+    r"\b(\w+)\s*\.\s*(" + "|".join(METHODS) + r")\s*\(\s*[`'\"]([^`'\"]*)[`'\"]\s*(.*)$",
+    re.I,
+)
+RE_USE = re.compile(
+    r"\b(\w+)\s*\.\s*use\s*\(\s*(?:[`'\"]([^`'\"]*)[`'\"]\s*,)?\s*(.*)$", re.I
+)
+
+
+def parse_express(rel: str, lines: list, prefix: str = "") -> list:
+    """Routes plus file-level middleware. Chains are resolved within the file."""
+    uses = []
+    for i, raw in enumerate(lines):
+        line = strip_comment(raw)
+        m = RE_USE.search(line)
+        if m and not re.search(r"\buse(State|Effect|Memo|Callback|Ref|Router)\b", line):
+            upath = m.group(2) or ""
+            toks = guard_tokens(m.group(3), rel, i + 1, "middleware")
+            if toks:
+                uses.append((upath, toks))
+
+    out = []
+    for i, raw in enumerate(lines):
+        line = strip_comment(raw)
+        m = RE_EXPRESS.search(line)
+        if not m:
+            continue
+        obj, method, path, rest = m.group(1), m.group(2), m.group(3), m.group(4)
+        if obj.lower() in {"axios", "fetch", "http", "https", "client", "api", "supertest", "request"}:
+            continue
+        if not path.startswith("/"):
+            continue
+        guards = guard_tokens(rest, rel, i + 1, "inline")
+        for upfx, toks in uses:
+            here = (prefix.rstrip("/") + path) if prefix else path
+            if not upfx or here.startswith(upfx.rstrip("/")) or path.startswith(upfx.rstrip("/")):
+                guards = toks + guards
+        handler = ""
+        hm = re.search(r",\s*(\w+)\s*\)\s*;?\s*$", rest)
+        if hm:
+            handler = hm.group(1)
+        full = (prefix.rstrip("/") + path) if prefix else path
+        r = route(method, full, rel, i + 1, handler, guards, "express")
+        if RATE_LIMIT.search(rest):
+            r["rate_limited"] = True
+        inspect_body(r, body_of(lines, i))
+        out.append(r)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Next.js App Router + server actions
+# --------------------------------------------------------------------------
+
+RE_NEXT_HANDLER = re.compile(
+    r"export\s+(?:async\s+)?(?:function|const)\s+(" + "|".join(m.upper() for m in METHODS) + r")\b"
+)
+RE_EXPORTED_FN = re.compile(r"export\s+(?:async\s+)?function\s+(\w+)")
+
+
+def next_path(rel: str) -> str:
+    parts = rel.split("/")
+    try:
+        idx = parts.index("app")
+    except ValueError:
+        idx = parts.index("src") if "src" in parts else -1
+    segs = parts[idx + 1 : -1] if idx >= 0 else parts[:-1]
+    keep = [s for s in segs if not (s.startswith("(") and s.endswith(")"))]
+    return "/" + "/".join(keep)
+
+
+def parse_next(rel: str, lines: list) -> list:
+    base = os.path.basename(rel)
+    text = "\n".join(lines)
+    out = []
+    if base.startswith("route."):
+        path = next_path(rel)
+        for i, raw in enumerate(lines):
+            m = RE_NEXT_HANDLER.search(strip_comment(raw))
+            if not m:
+                continue
+            r = route(m.group(1), path, rel, i + 1, m.group(1), [], "next-route")
+            inspect_body(r, body_of(lines, i))
+            out.append(r)
+    is_action_file = bool(re.search(r"^\s*['\"]use server['\"]", text, re.M))
+    if is_action_file:
+        for i, raw in enumerate(lines):
+            m = RE_EXPORTED_FN.search(strip_comment(raw))
+            if not m:
+                continue
+            r = route("POST", f"{next_path(rel)}#{m.group(1)}", rel, i + 1,
+                      m.group(1), [], "server-action")
+            inspect_body(r, py_body(lines, i) or body_of(lines, i))
+            out.append(r)
+    return out
+
+
+# --------------------------------------------------------------------------
+# FastAPI / Flask
+# --------------------------------------------------------------------------
+
+RE_FASTAPI = re.compile(
+    r"@\s*(\w+)\s*\.\s*(" + "|".join(METHODS) + r")\s*\(\s*[`'\"]([^`'\"]*)[`'\"](.*)$",
+    re.I,
+)
+RE_FLASK = re.compile(
+    r"@\s*(\w+)\s*\.\s*route\s*\(\s*[`'\"]([^`'\"]*)[`'\"](.*)$", re.I
+)
+
+
+def parse_python(rel: str, lines: list) -> list:
+    out = []
+    for i, raw in enumerate(lines):
+        line = strip_comment(raw)
+        methods, path, rest = None, None, ""
+        m = RE_FASTAPI.search(line)
+        if m:
+            methods, path, rest = [m.group(2)], m.group(3), m.group(4)
+        else:
+            m = RE_FLASK.search(line)
+            if m:
+                path, rest = m.group(2), m.group(3)
+                found = re.findall(r"['\"](GET|POST|PUT|PATCH|DELETE)['\"]", rest, re.I)
+                methods = found or ["GET"]
+        if not path or not path.startswith("/"):
+            continue
+        # decorators stack above the def, and extra args may wrap to later lines
+        window = "\n".join(l for _, l in [(j, lines[j]) for j in range(i, min(len(lines), i + 6))])
+        guards = guard_tokens(window.split("def ")[0], rel, i + 1, "decorator")
+        for j in range(max(0, i - 6), i):
+            if lines[j].lstrip().startswith("@"):
+                guards += guard_tokens(lines[j], rel, j + 1, "decorator")
+        body = py_body(lines, i)
+        sig = " ".join(l for _, l in body[:4])
+        guards += [
+            g for g in guard_tokens(sig, rel, i + 1, "depends")
+            if "depends" in sig.lower()
+        ]
+        for meth in methods:
+            r = route(meth, path, rel, i + 1,
+                      (re.search(r"def\s+(\w+)", sig).group(1) if re.search(r"def\s+(\w+)", sig) else ""),
+                      list(guards), "python")
+            if RATE_LIMIT.search(window):
+                r["rate_limited"] = True
+            inspect_body(r, body)
+            out.append(r)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Laravel
+# --------------------------------------------------------------------------
+
+RE_LARAVEL = re.compile(
+    r"Route\s*::\s*(" + "|".join(METHODS) + r"|resource|apiResource)\s*\(\s*['\"]([^'\"]*)['\"](.*)$",
+    re.I,
+)
+RE_LARAVEL_GROUP = re.compile(r"Route\s*::\s*(?:middleware|group|prefix)\s*\((.*)$", re.I)
+
+
+def parse_php(rel: str, lines: list) -> list:
+    out = []
+    group_stack = []
+    for i, raw in enumerate(lines):
+        line = strip_comment(raw)
+        gm = RE_LARAVEL_GROUP.search(line)
+        if gm:
+            toks = guard_tokens(gm.group(1), rel, i + 1, "group")
+            prefix = ""
+            pm = re.search(r"prefix\s*\(\s*['\"]([^'\"]*)['\"]", line, re.I)
+            if pm:
+                prefix = pm.group(1)
+            group_stack.append({
+                "depth": line.count("{") - line.count("}"),
+                "guards": toks, "prefix": prefix,
+            })
+        m = RE_LARAVEL.search(line)
+        if not m:
+            continue
+        verb, path, rest = m.group(1).lower(), m.group(2), m.group(3)
+        guards = guard_tokens(rest, rel, i + 1, "chain")
+        prefix = ""
+        for g in group_stack:
+            guards = g["guards"] + guards
+            prefix = (prefix + "/" + g["prefix"].strip("/")).strip("/") if g["prefix"] else prefix
+        full = ("/" + prefix + "/" + path.strip("/")).replace("//", "/")
+        verbs = ["GET", "POST", "PUT", "DELETE"] if verb in {"resource", "apiresource"} else [verb]
+        for v in verbs:
+            r = route(v, full, rel, i + 1, "", list(guards), "laravel")
+            if RATE_LIMIT.search(rest):
+                r["rate_limited"] = True
+            out.append(r)
+    return out
+
+
+# --------------------------------------------------------------------------
+
+def build(root: str) -> dict:
+    files = walk(root)
+    mounts = mount_map(files)
+    routes, frameworks = [], set()
+    for rel, _full, lines in files:
+        ext = os.path.splitext(rel)[1].lower()
+        if ext in JS_EXT:
+            base = os.path.basename(rel)
+            if base.startswith("route.") or "/app/" in f"/{rel}" or rel.startswith("app/"):
+                found = parse_next(rel, lines)
+                if found:
+                    frameworks.add("next")
+                    routes += found
+            found = parse_express(rel, lines, mounts.get(rel, ""))
+            if found:
+                frameworks.add("express")
+                routes += found
+        elif ext in PY_EXT:
+            found = parse_python(rel, lines)
+            if found:
+                frameworks.add("fastapi/flask")
+                routes += found
+        elif ext in PHP_EXT:
+            found = parse_php(rel, lines)
+            if found:
+                frameworks.add("laravel")
+                routes += found
+
+    # guards declared where a router is mounted apply to everything inside it
+    prefix_guards = []
+    for rel, _full, lines in files:
+        if os.path.splitext(rel)[1].lower() not in JS_EXT:
+            continue
+        for i, raw in enumerate(lines):
+            m = RE_USE.search(strip_comment(raw))
+            if not m or not m.group(2):
+                continue
+            toks = guard_tokens(m.group(3), rel, i + 1, "mounted-middleware")
+            if toks:
+                prefix_guards.append((m.group(2).rstrip("/"), toks))
+    for r in routes:
+        if r["kind"] != "express":
+            continue  # a Next.js handler is not mounted in the Express app
+        for pfx, toks in prefix_guards:
+            if pfx and r["path"].startswith(pfx) and not any(
+                g["name"] == t["name"] for g in r["guards"] for t in toks
+            ):
+                r["guards"] = toks + r["guards"]
+
+    seen, uniq = set(), []
+    for r in routes:
+        key = (r["method"], r["path"], r["file"], r["line"])
+        if key in seen:
+            continue
+        seen.add(key)
+        level, roles = classify(r["guards"])
+        # identity established inside the handler counts, but only if the handler
+        # does something about it: a session that is read and ignored is not a guard
+        if level == "public" and r["session_source"] and r["enforces"]:
+            level = "authed"
+        if level == "authed" and r["owner_check"]:
+            level = "owner"
+        r["level"] = level
+        r["roles"] = roles
+        uniq.append(r)
+
+    uniq.sort(key=lambda r: (r["path"], r["method"]))
+    all_roles = sorted({x for r in uniq for x in r["roles"]})
+    return {
+        "source": root,
+        "files_scanned": len(files),
+        "frameworks": sorted(frameworks),
+        "route_count": len(uniq),
+        "roles": all_roles,
+        "routes": uniq,
+    }
+
+
+def main(argv: list) -> int:
+    args = [a for a in argv[1:] if not a.startswith("--")]
+    if not args:
+        print("usage: routes.py <path-to-codebase> [--json]", file=sys.stderr)
+        return 2
+    json.dump(build(args[0]), sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
