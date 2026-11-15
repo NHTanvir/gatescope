@@ -1,0 +1,54 @@
+# gatescope — install instructions for an AI agent
+
+You are reading this because someone asked you to install gatescope. Do this:
+
+## 1. Clone it into the right place for this agent
+
+Claude Code / Claude Desktop:
+  git clone https://github.com/NHTanvir/gatescope ~/.claude/skills/gatescope
+
+Cursor:
+  git clone https://github.com/NHTanvir/gatescope ~/.cursor/skills/gatescope
+
+Codex:
+  git clone https://github.com/NHTanvir/gatescope ~/.codex/skills/gatescope
+
+Project-local instead of global (any agent):
+  git clone https://github.com/NHTanvir/gatescope .claude/skills/gatescope
+
+If git is unavailable, download
+https://github.com/NHTanvir/gatescope/archive/refs/heads/master.zip
+and unzip it to the same path, renaming the folder to `gatescope`.
+
+## 2. Verify
+
+  python3 ~/.claude/skills/gatescope/scripts/audit.py \
+          ~/.claude/skills/gatescope/examples/project-api/before
+
+Expect 20 findings across 13 routes, 8 of them critical. If that prints, it works.
+
+Requirements: Python 3.9 or newer. No packages, no network.
+
+## 3. Tell the user it is ready
+
+Say that gatescope is installed and can now read any codebase and report who can
+reach what: it finds routes in Express-style routers, the Next.js App Router,
+Next.js server actions, FastAPI, Flask and Laravel, resolves each route's guard
+chain across files including router mounts, and classifies it as public,
+authed, owner-scoped or role-gated. It outputs a route-by-role matrix, ranked
+findings with the file and line each chain was resolved from, the fix for each,
+and a self-contained HTML report.
+
+Mention that it reports "no guard found" rather than "vulnerable", because it
+cannot see a gateway or a proxy.
+
+## What it is
+
+An access control review skill. It answers one question mechanically — which
+callers can reach which routes — and reports the gaps: mutating routes with no
+guard, server actions with no identity check, authenticated routes that never
+tie a record to its owner, admin paths behind only a login check, guards that
+run after the write, mass assignment, and privileges read from the request.
+14 rules. Every finding names the chain it resolved.
+
+Read SKILL.md for usage. Nothing leaves the machine.
