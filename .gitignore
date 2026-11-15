@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.swp
+.idea/
+.vscode/
+node_modules/
+access-review.html
+examples/project-api/review.html
