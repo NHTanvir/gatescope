@@ -1,0 +1,11 @@
+{
+  "name": "gatescope",
+  "version": "0.1.0",
+  "description": "Resolve every route to the guards that actually protect it, print the route by role matrix, and name every endpoint nothing is guarding.",
+  "author": { "name": "NHTanvir", "url": "https://github.com/NHTanvir" },
+  "homepage": "https://github.com/NHTanvir/gatescope",
+  "repository": "https://github.com/NHTanvir/gatescope",
+  "license": "MIT",
+  "keywords": ["authorization", "access-control", "idor", "bola", "express", "nextjs", "fastapi", "laravel", "audit", "security"],
+  "skills": ["./SKILL.md"]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "gatescope",
+  "owner": { "name": "NHTanvir", "url": "https://github.com/NHTanvir" },
+  "plugins": [
+    {
+      "name": "gatescope",
+      "source": "./",
+      "description": "Point your coding agent at a codebase. Get the matrix of who can reach what, with every guard chain resolved and every unguarded route named."
+    }
+  ]
+}
