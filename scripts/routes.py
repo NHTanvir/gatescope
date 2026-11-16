@@ -61,9 +61,12 @@ CSRF = re.compile(r"\b(csrf|xsrf|same_?site|double_?submit)\b", re.I)
 
 # Middleware declared as a string: Laravel's ->middleware('auth'), Flask-style
 # lists, FastAPI dependency names. Anchored, so a path never matches by accident.
+# Not here on purpose: `web` (sessions and CSRF), `session`, `signed` (a URL
+# signature) and `guest` (the opposite of a login check). None of them establishes
+# who the caller is, and crediting one hides a route that nothing guards.
 MW_IDENTITY = re.compile(
     r"^(auth|auth\.\w+|auth:[\w,.-]+|sanctum|jwt|jwt\.auth|jwt_?auth|verified|"
-    r"signed|session|authenticated|protected|guest|web)$", re.I
+    r"authenticated|protected)$", re.I
 )
 MW_ROLE = re.compile(
     r"^(role|roles|admin|is_?admin|superuser|staff)(?::[\w,.|-]+)?$|"
@@ -562,45 +565,193 @@ def parse_python(rel: str, lines: list) -> list:
 # Laravel
 # --------------------------------------------------------------------------
 
+LARAVEL_VERBS = METHODS + ("any",)
 RE_LARAVEL = re.compile(
-    r"Route\s*::\s*(" + "|".join(METHODS) + r"|resource|apiResource)\s*\(\s*['\"]([^'\"]*)['\"](.*)$",
+    r"Route\s*::\s*(" + "|".join(LARAVEL_VERBS)
+    + r"|resource|apiResource)\s*\(\s*['\"]([^'\"]*)['\"](.*)$",
     re.I,
 )
-RE_LARAVEL_GROUP = re.compile(r"Route\s*::\s*(?:middleware|group|prefix)\s*\((.*)$", re.I)
+# Route::middleware('auth')->get('/me', ...): a guard chained in front of one route
+RE_LARAVEL_CHAINED = re.compile(
+    r"->\s*(" + "|".join(LARAVEL_VERBS)
+    + r"|resource|apiResource)\s*\(\s*['\"]([^'\"]*)['\"](.*)$",
+    re.I,
+)
+RE_LARAVEL_HEAD = re.compile(
+    r"Route\s*::\s*(?:middleware|group|prefix|name|domain|controller)\s*\(", re.I
+)
+# what Route::resource registers, minus the two HTML form pages
+RESOURCE_ACTIONS = [
+    ("index", "GET", ""), ("store", "POST", ""), ("show", "GET", "/{%s}"),
+    ("update", "PUT", "/{%s}"), ("destroy", "DELETE", "/{%s}"),
+]
+
+
+def _call_args(text: str, open_idx: int) -> str:
+    """The text between the parenthesis at `open_idx` and the one that closes it."""
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1 : j]
+    return text[open_idx + 1 :]
+
+
+def laravel_guards(text: str, file: str, line: int, via: str) -> list:
+    """Guards a Laravel statement declares, read from its middleware and nowhere else.
+
+    A prefix, a route name and a controller are not guards. Tokenising the whole
+    line reads `->prefix('admin')` as a role and `->name('auth.login')` as a
+    login check, which credits protection that is not there.
+    """
+    parts = []
+    for m in re.finditer(r"(?<![A-Za-z])middleware\s*\(", text):
+        parts.append(_call_args(text, m.end() - 1))
+    for m in re.finditer(
+        r"['\"]middleware['\"]\s*=>\s*(\[[^\]]*\]|['\"][^'\"]*['\"])", text
+    ):
+        parts.append(m.group(1))
+    return guard_tokens(" ".join(parts), file, line, via) if parts else []
+
+
+def _guard_key(name: str) -> str:
+    """`App\\Http\\Middleware\\Authenticate::class` and `auth:sanctum` -> comparable names."""
+    return name.replace("::class", "").split("\\")[-1].split(":")[0].lower()
+
+
+def laravel_removed(text: str) -> set:
+    """Names passed to withoutMiddleware(...), which undo an inherited guard."""
+    names = set()
+    for m in re.finditer(r"withoutMiddleware\s*\(", text):
+        args = _call_args(text, m.end() - 1)
+        for lit in re.findall(r"['\"]([\w.:|,\\-]+)['\"]", args):
+            names.add(_guard_key(lit))
+        for cls in re.findall(r"([A-Za-z_\\]+)::class", args):
+            names.add(_guard_key(cls))
+    return names
+
+
+def laravel_prefix(text: str) -> str:
+    m = re.search(r"prefix\s*\(\s*['\"]([^'\"]*)['\"]", text) or re.search(
+        r"['\"]prefix['\"]\s*=>\s*['\"]([^'\"]*)['\"]", text
+    )
+    return m.group(1).strip("/") if m else ""
+
+
+def _singular(word: str) -> str:
+    """photos -> photo, categories -> category. Only used to name a route parameter."""
+    word = word.replace("-", "_")
+    if word.endswith("ies") and len(word) > 3:
+        return word[:-3] + "y"
+    if word.endswith("ses") and len(word) > 3:
+        return word[:-2]
+    if word.endswith("s") and not word.endswith("ss") and len(word) > 1:
+        return word[:-1]
+    return word
 
 
 def parse_php(rel: str, lines: list) -> list:
     out = []
-    group_stack = []
+    stack = []      # groups whose closure is open
+    pending = None  # a declaration spread over several lines that has not opened yet
+    depth = 0
     for i, raw in enumerate(lines):
         line = strip_comment(raw)
-        gm = RE_LARAVEL_GROUP.search(line)
-        if gm:
-            toks = guard_tokens(gm.group(1), rel, i + 1, "group")
-            prefix = ""
-            pm = re.search(r"prefix\s*\(\s*['\"]([^'\"]*)['\"]", line, re.I)
-            if pm:
-                prefix = pm.group(1)
-            group_stack.append({
-                "depth": line.count("{") - line.count("}"),
-                "guards": toks, "prefix": prefix,
-            })
-        m = RE_LARAVEL.search(line)
-        if not m:
-            continue
-        verb, path, rest = m.group(1).lower(), m.group(2), m.group(3)
-        guards = guard_tokens(rest, rel, i + 1, "chain")
-        prefix = ""
-        for g in group_stack:
-            guards = g["guards"] + guards
-            prefix = (prefix + "/" + g["prefix"].strip("/")).strip("/") if g["prefix"] else prefix
-        full = ("/" + prefix + "/" + path.strip("/")).replace("//", "/")
-        verbs = ["GET", "POST", "PUT", "DELETE"] if verb in {"resource", "apiresource"} else [verb]
-        for v in verbs:
-            r = route(v, full, rel, i + 1, "", list(guards), "laravel")
-            if RATE_LIMIT.search(rest):
-                r["rate_limited"] = True
-            out.append(r)
+        stripped = line.strip()
+        before = depth
+        depth += line.count("{") - line.count("}")
+
+        direct = RE_LARAVEL.search(line)
+        continuing = pending is not None and stripped.startswith("->")
+        # anything in front of a route on the same line is a group opening around it
+        head_text = line[: direct.start()] if direct else line
+        head = RE_LARAVEL_HEAD.search(head_text) if stripped.startswith("Route") else None
+        chained = None
+        if not direct and (head or continuing):
+            chained = RE_LARAVEL_CHAINED.search(line)
+
+        if head and not chained:
+            pending = {
+                "guards": laravel_guards(head_text, rel, i + 1, "group"),
+                "prefix": laravel_prefix(head_text),
+                "throttle": bool(RATE_LIMIT.search(head_text)),
+                "is_group": False,
+            }
+        elif continuing and not chained:
+            pending["guards"] += laravel_guards(line, rel, i + 1, "group")
+            more = laravel_prefix(line)
+            if more:
+                pending["prefix"] = "/".join(p for p in (pending["prefix"], more) if p)
+            pending["throttle"] = pending["throttle"] or bool(RATE_LIMIT.search(line))
+
+        if pending is not None and not chained:
+            scope = head_text if head else line
+            if re.search(r"\bgroup\s*\(", scope):
+                pending["is_group"] = True
+            if pending["is_group"] and "{" in scope:
+                pending["depth"] = before
+                stack.append(pending)
+                pending = None
+            elif stripped.endswith(";"):
+                pending = None  # the statement ended without opening a closure
+
+        m = direct or chained
+        if m:
+            verb, path, rest = m.group(1).lower(), m.group(2), m.group(3)
+            # the statement: this line, plus any `->middleware(...)` lines chained under it
+            stmt = line[m.start():] if direct else line
+            j = i + 1
+            while not stmt.rstrip().endswith(";") and j < min(len(lines), i + 8):
+                nxt = strip_comment(lines[j])
+                if not nxt.strip().startswith("->"):
+                    break
+                stmt += " " + nxt.strip()
+                j += 1
+            own = laravel_guards(stmt, rel, i + 1, "chain")
+            inherited = [g for grp in stack for g in grp["guards"]]
+            prefixes = [grp["prefix"] for grp in stack]
+            throttled = any(grp["throttle"] for grp in stack)
+            if chained and pending is not None:
+                inherited += pending["guards"]
+                prefixes.append(pending["prefix"])
+                throttled = throttled or pending["throttle"]
+            if chained:
+                prefixes.append(laravel_prefix(line[: m.start()]))
+            removed = laravel_removed(stmt)
+            guards = [g for g in inherited if _guard_key(g["name"]) not in removed] + own
+            base = "/".join(p for p in prefixes + [path.strip("/")] if p)
+
+            if verb in {"resource", "apiresource"}:
+                ident = _singular(path.strip("/").split("/")[-1].split(".")[-1]) or "id"
+                keep = None
+                om = re.search(r"->only\s*\(([^)]*)\)", stmt)
+                em = re.search(r"->except\s*\(([^)]*)\)", stmt)
+                if om:
+                    keep = set(re.findall(r"['\"](\w+)['\"]", om.group(1)))
+                specs = [
+                    (meth, suffix % ident if "%s" in suffix else suffix)
+                    for action, meth, suffix in RESOURCE_ACTIONS
+                    if (keep is None or action in keep)
+                    and not (em and action in re.findall(r"['\"](\w+)['\"]", em.group(1)))
+                ]
+            elif verb == "any":
+                specs = [("ALL", "")]
+            else:
+                specs = [(verb, "")]
+
+            for meth, suffix in specs:
+                r = route(meth, "/" + base + suffix, rel, i + 1, "", list(guards), "laravel")
+                if throttled or RATE_LIMIT.search(stmt):
+                    r["rate_limited"] = True
+                out.append(r)
+            if chained and pending is not None and stripped.endswith(";"):
+                pending = None
+
+        while stack and depth <= stack[-1]["depth"]:
+            stack.pop()
     return out
 
 
