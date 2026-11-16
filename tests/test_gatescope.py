@@ -177,6 +177,150 @@ class TestDiscovery(Base):
         self.assertEqual(r["level"], "role")
         self.assertIn("admin", r["roles"])
 
+    def test_laravel_group_ends_at_its_closing_brace(self):
+        got = self.by_label({
+            "routes/api.php": (
+                "<?php\nRoute::middleware(['auth:sanctum'])->group(function () {\n"
+                "    Route::get('/projects/{id}', [P::class, 'show']);\n"
+                "});\n"
+                "Route::post('/webhooks/stripe', [W::class, 'handle']);\n"
+            ),
+        })
+        self.assertEqual(got["GET /projects/{id}"]["level"], "authed")
+        # declared after the group closed: crediting the group here hides a hole
+        self.assertEqual(got["POST /webhooks/stripe"]["level"], "public")
+        self.assertEqual(got["POST /webhooks/stripe"]["guards"], [])
+
+    def test_laravel_nested_groups_close_independently(self):
+        got = self.by_label({
+            "routes/api.php": (
+                "<?php\nRoute::middleware('auth')->prefix('api')->group(function () {\n"
+                "    Route::middleware('role:admin')->prefix('admin')->group(function () {\n"
+                "        Route::get('/users', [U::class, 'index']);\n"
+                "    });\n"
+                "    Route::get('/me', [U::class, 'me']);\n"
+                "});\n"
+            ),
+        })
+        self.assertEqual(got["GET /api/admin/users"]["level"], "role")
+        self.assertEqual(got["GET /api/me"]["level"], "authed")
+
+    def test_laravel_group_declared_over_several_lines(self):
+        got = self.by_label({
+            "routes/web.php": (
+                "<?php\nRoute::middleware(['auth'])\n"
+                "    ->prefix('account')\n"
+                "    ->group(function () {\n"
+                "        Route::get('/settings', [S::class, 'show']);\n"
+                "    });\n"
+                "Route::get('/pricing', [M::class, 'pricing']);\n"
+            ),
+        })
+        self.assertEqual(got["GET /account/settings"]["level"], "authed")
+        self.assertEqual(got["GET /pricing"]["level"], "public")
+
+    def test_laravel_array_style_group(self):
+        got = self.by_label({
+            "routes/web.php": (
+                "<?php\nRoute::group(['middleware' => ['auth'], 'prefix' => 'admin'], function () {\n"
+                "    Route::get('/users', [U::class, 'index']);\n"
+                "});\n"
+            ),
+        })
+        r = got["GET /admin/users"]
+        # the prefix is `admin`; the middleware is only `auth`
+        self.assertEqual(r["level"], "authed")
+        self.assertEqual(r["roles"], [])
+
+    def test_laravel_prefix_is_not_a_role(self):
+        got = self.by_label({
+            "routes/web.php": (
+                "<?php\nRoute::middleware('auth')->prefix('admin')->group(function () {\n"
+                "    Route::get('/users', [U::class, 'index']);\n"
+                "});\n"
+            ),
+        })
+        self.assertEqual(got["GET /admin/users"]["level"], "authed")
+
+    def test_laravel_route_name_is_not_a_guard(self):
+        r = self.one({
+            "routes/web.php":
+                "<?php\nRoute::post('/login', [A::class, 'store'])->name('auth.login');\n",
+        })
+        self.assertEqual(r["level"], "public")
+
+    def test_laravel_web_and_guest_are_not_identity(self):
+        got = self.by_label({
+            "routes/web.php": (
+                "<?php\nRoute::middleware('web')->group(function () {\n"
+                "    Route::post('/contact', [C::class, 'send']);\n"
+                "});\n"
+                "Route::get('/register', [R::class, 'create'])->middleware('guest');\n"
+            ),
+        })
+        self.assertEqual(got["POST /contact"]["level"], "public")
+        self.assertEqual(got["GET /register"]["level"], "public")
+
+    def test_laravel_guard_chained_in_front_of_one_route(self):
+        got = self.by_label({
+            "routes/api.php": (
+                "<?php\nRoute::middleware('auth:sanctum')->get('/me', [U::class, 'me']);\n"
+                "Route::get('/status', [S::class, 'show']);\n"
+            ),
+        })
+        self.assertEqual(got["GET /me"]["level"], "authed")
+        # and it is one route's guard, not a group that never closes
+        self.assertEqual(got["GET /status"]["level"], "public")
+
+    def test_laravel_middleware_on_the_line_below_the_route(self):
+        r = self.one({
+            "routes/api.php": (
+                "<?php\nRoute::delete('/projects/{id}', [P::class, 'destroy'])\n"
+                "    ->middleware('auth')\n"
+                "    ->name('projects.destroy');\n"
+            ),
+        })
+        self.assertEqual(r["level"], "authed")
+
+    def test_laravel_without_middleware_removes_the_inherited_guard(self):
+        got = self.by_label({
+            "routes/api.php": (
+                "<?php\nRoute::middleware('auth')->group(function () {\n"
+                "    Route::get('/feed', [F::class, 'index'])->withoutMiddleware('auth');\n"
+                "    Route::get('/inbox', [I::class, 'index']);\n"
+                "});\n"
+            ),
+        })
+        self.assertEqual(got["GET /feed"]["level"], "public")
+        self.assertEqual(got["GET /inbox"]["level"], "authed")
+
+    def test_laravel_resource_expands_to_the_routes_it_registers(self):
+        got = self.by_label({
+            "routes/api.php":
+                "<?php\nRoute::apiResource('photos', PhotoController::class)->middleware('auth');\n",
+        })
+        self.assertEqual(sorted(got), [
+            "DELETE /photos/{photo}", "GET /photos", "GET /photos/{photo}",
+            "POST /photos", "PUT /photos/{photo}",
+        ])
+        self.assertTrue(all(r["level"] == "authed" for r in got.values()))
+
+    def test_laravel_resource_only(self):
+        got = self.by_label({
+            "routes/api.php":
+                "<?php\nRoute::resource('categories', C::class)->only(['index', 'show']);\n",
+        })
+        self.assertEqual(sorted(got), ["GET /categories", "GET /categories/{category}"])
+
+    def test_laravel_throttle_on_the_group_counts_for_its_routes(self):
+        self.assertNotIn("auth_route_no_rate_limit", self.rules({
+            "routes/api.php": (
+                "<?php\nRoute::middleware('throttle:5,1')->group(function () {\n"
+                "    Route::post('/login', [A::class, 'store']);\n"
+                "});\n"
+            ),
+        }))
+
     def test_comment_is_not_a_route(self):
         doc = self.build({"api.js": "// app.get('/old', handler);\n"})
         self.assertEqual(doc["route_count"], 0)
