@@ -121,11 +121,11 @@ production code without being a scan of production.
 
 | Framework | Routes from | Guards from |
 |---|---|---|
-| Express / Fastify / Koa-style | `app.get`, `router.post`, … | inline middleware, `app.use`, the mount in another file |
+| Express / Fastify / Koa-style | `app.get`, `router.post`, `router.route('/x').get().post()` | inline middleware, `app.use`, the mount in another file |
 | Next.js App Router | `app/**/route.ts` exports | `auth()` / `getServerSession()` in the handler |
 | Next.js server actions | exported functions in a `"use server"` file | the identity check inside the action |
-| FastAPI | `@app.get`, `@router.post` | decorators and `Depends(...)` |
-| Flask | `@app.route(..., methods=[…])` | decorators such as `@login_required` |
+| FastAPI | `@app.get`, `@router.post` | decorators, `Depends(...)`, and the `prefix` and `dependencies` of `APIRouter`, `include_router` and `FastAPI(...)`, across files |
+| Flask | `@app.route(..., methods=[…])` | decorators such as `@login_required`, and `Blueprint` / `register_blueprint` URL prefixes |
 | Laravel | `Route::get`, `Route::resource` | `->middleware('auth')`, `Route::middleware([...])->group` |
 
 Router mounts are resolved across files: a route written as `/:id` in
@@ -204,6 +204,8 @@ Known limits, stated rather than hidden:
 - `owner` requires the query to be constrained by a session value. An ownership
   check done in application code after the fetch is not recognised, and will
   read as `authed`.
+- A guard that Flask applies with `@bp.before_request`, or that Django applies as
+  middleware, is not followed, so those routes read as `public` unless a decorator says otherwise.
 - It never sends a request anywhere, so it cannot confirm that a guard works —
   only that one is there.
 
