@@ -365,6 +365,53 @@ class TestDiscovery(Base):
             ),
         }))
 
+    def test_router_route_chain_lists_every_verb(self):
+        got = self.by_label({"a.js": (
+            "router.route('/items')\n  .get(requireAuth, list)\n  .post(requireAuth, create);\n")})
+        self.assertEqual(sorted(got), ["GET /items", "POST /items"])
+        self.assertTrue(all(r["level"] == "authed" for r in got.values()))
+
+    def test_an_unguarded_verb_in_a_chain_is_reported(self):
+        files = {"a.js": (
+            "router.route('/items')\n  .get(list)\n  .post(requireAuth, create)\n  .delete(remove);\n")}
+        got = self.by_label(files)
+        self.assertEqual(got["POST /items"]["level"], "authed")
+        self.assertEqual(got["DELETE /items"]["level"], "public")
+        self.assertIn("unauthenticated_mutation", self.rules(files))
+
+    def test_router_route_chain_on_one_line(self):
+        got = self.by_label({"a.js": (
+            "router.route('/a').get(requireAuth, list).post(requireAuth, create);\n")})
+        self.assertEqual(sorted(got), ["GET /a", "POST /a"])
+
+    def test_router_route_chain_with_multi_line_inline_handlers(self):
+        got = self.by_label({"a.js": (
+            "router.route('/p/:id')\n"
+            "  .get(requireAuth, async (req, res) => {\n"
+            "    res.json(await db.p.findFirst({ where: { id: req.params.id, userId: req.user.id } }));\n"
+            "  })\n"
+            "  .delete(async (req, res) => {\n"
+            "    await db.p.delete({ where: { id: req.params.id } });\n"
+            "  });\n")})
+        self.assertEqual(got["GET /p/:id"]["level"], "owner")
+        self.assertEqual(got["DELETE /p/:id"]["level"], "public")
+
+    def test_router_route_chain_gets_the_mount_prefix_and_mount_guard(self):
+        got = self.by_label({
+            "server.js": ("const items = require('./items');\n"
+                          "app.use('/api/items', requireAuth);\napp.use('/api/items', items);\n"),
+            "items.js": "router.route('/').post(create);\n",
+        })
+        self.assertEqual(got["POST /api/items"]["level"], "authed")
+
+    def test_a_route_after_a_chain_is_still_found(self):
+        got = self.by_label({"a.js": (
+            "router.route('/a').get(list).post(create);\nrouter.get('/b', requireAuth, other);\n")})
+        self.assertEqual(sorted(got), ["GET /a", "GET /b", "POST /a"])
+
+    def test_a_http_client_route_call_is_not_a_router(self):
+        self.assertEqual(self.build({"a.js": "supertest.route('/x').get(y);\n"})["route_count"], 0)
+
     def test_comment_is_not_a_route(self):
         doc = self.build({"api.js": "// app.get('/old', handler);\n"})
         self.assertEqual(doc["route_count"], 0)
