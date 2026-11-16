@@ -234,6 +234,34 @@ def classify(tokens: list) -> tuple:
     return level, sorted(set(roles))
 
 
+# Guard names that the plain vocabulary above misses, because its leading \b never
+# fires inside a camelCase word (ensureAuthenticated, isLoggedIn, requireUser).
+# Matched against the WHOLE identifier, snake_cased, so authController.register,
+# auth.login and authService are not mistaken for guards.
+EXTRA_IDENTITY = re.compile(
+    r"^(?:authn|authed|auth_check|is_auth\w*|ensure_auth\w*|is_logged_?in|logged_?in|"
+    r"ensure_logged_?in|require_login|require_user|require_session|require_token|"
+    r"verify_(?:user|token|jwt|session|auth)\w*|check_(?:jwt|auth|token|session|user)\w*|"
+    r"validate_(?:token|jwt|session|user)\w*|jwt_auth\w*|auth_jwt\w*|jwt_check|"
+    r"with_user|with_session|get_current_\w+|oauth2_scheme|authenticate\w*|"
+    r"authenticated\w*)$"
+)
+
+
+def _snake(word: str) -> str:
+    """ensureAuthenticated -> ensure_authenticated"""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", word).replace("-", "_").lower()
+
+
+def extra_identity(word: str) -> bool:
+    parts = word.split(".")
+    last = _snake(parts[-1])
+    if len(parts) == 1 and last == "auth":
+        return True  # `app.post(path, auth, handler)`; `auth.login` is a namespace
+    return bool(EXTRA_IDENTITY.match(last))
+
+
+
 def guard_tokens(text: str, file: str, line: int, via: str) -> list:
     """Every guard-looking identifier on a line, with what it is."""
     found = []
@@ -245,7 +273,7 @@ def guard_tokens(text: str, file: str, line: int, via: str) -> list:
                 "name": word, "kind": "role", "roles": roles,
                 "file": file, "line": line, "via": via,
             })
-        elif IDENTITY.search(word):
+        elif IDENTITY.search(word) or (via != "body" and extra_identity(word)):
             found.append({
                 "name": word, "kind": "identity", "roles": [],
                 "file": file, "line": line, "via": via,
