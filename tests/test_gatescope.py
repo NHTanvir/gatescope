@@ -484,6 +484,26 @@ class TestDiscovery(Base):
         self.assertEqual(got["POST /a/x"]["level"], "authed")
         self.assertEqual(got["POST /b/y"]["level"], "public")
 
+    def test_double_slash_inside_a_template_literal_does_not_hide_the_rest_of_the_line(self):
+        r = self.one({"a.js": (
+            "app.patch('/p/:id', requireAuth, async (req, res) => {\n"
+            "  await db.p.updateMany({ data: { url: `https://x.com/${req.params.id}`, userId: req.user.id },"
+            " where: { id: req.params.id, userId: req.user.id } });\n});\n")})
+        self.assertEqual(r["level"], "owner")
+
+    def test_code_after_a_private_member_is_not_a_comment(self):
+        r = self.one({"a.js": (
+            "app.patch('/p/:id', requireAuth, async (req, res) => {\n"
+            "  const x = this.#cache; await db.p.updateMany({ where: { id: req.params.id, userId: req.user.id } });\n"
+            "});\n")})
+        self.assertEqual(r["level"], "owner")
+
+    def test_real_comments_are_still_ignored(self):
+        got = self.by_label({"a.js": "// app.post('/old', h);\napp.get('/ok', requireAuth, h); // trailing\n"})
+        self.assertEqual(sorted(got), ["GET /ok"])
+        py = self.by_label({"m.py": "# @app.post('/old')\n@app.get('/ok')\ndef ok():\n    return 1  # fine\n"})
+        self.assertEqual(sorted(py), ["GET /ok"])
+
     def test_comment_is_not_a_route(self):
         doc = self.build({"api.js": "// app.get('/old', handler);\n"})
         self.assertEqual(doc["route_count"], 0)

@@ -173,7 +173,14 @@ def strip_comment(line: str) -> str:
         idx = line.find(marker)
         while idx != -1:
             before = line[:idx]
-            if before.count("'") % 2 == 0 and before.count('"') % 2 == 0:
+            # this.#session is a private member; a // inside a backtick string is text
+            private_member = marker == "#" and idx > 0 and line[idx - 1] == "."
+            if (
+                before.count("'") % 2 == 0
+                and before.count('"') % 2 == 0
+                and before.count("`") % 2 == 0
+                and not private_member
+            ):
                 return before
             idx = line.find(marker, idx + 1)
     return line
