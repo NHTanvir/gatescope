@@ -763,9 +763,48 @@ def py_router_map(files: list) -> dict:
     return out
 
 
+RE_PY_BEFORE = re.compile(r"^[ \t]*@\s*(\w+)\s*\.\s*(before_request|before_app_request)\b", re.M)
+RE_PY_FLASK_APP = re.compile(r"^[ \t]*(\w+)\s*=\s*Flask\s*\(", re.M)
+
+
+def py_before_request(rel: str, lines: list) -> list:
+    """Guards that Flask applies to every request via before_request.
+
+    Returns [(object, app_wide, guard token)] for each hook whose body actually
+    enforces something about identity. A hook that only logs guards nothing.
+    """
+    text = "\n".join(lines)
+    flask_apps = {m.group(1) for m in RE_PY_FLASK_APP.finditer(text)}
+    found = []
+    for m in RE_PY_BEFORE.finditer(text):
+        at = text[: m.start()].count("\n")
+        # the def sits on the next non-decorator line
+        d = at + 1
+        while d < len(lines) and lines[d].lstrip().startswith("@"):
+            d += 1
+        if d >= len(lines):
+            continue
+        probe = route("GET", "/", rel, d + 1)
+        inspect_body(probe, py_body(lines, d))
+        tokens = list(probe["guards"])
+        if not tokens and probe["session_source"] and probe["enforces"]:
+            tokens = [{"name": "session check", "kind": "identity", "roles": [], "file": rel,
+                       "line": d + 1, "via": "body"}]
+        if not tokens or not probe["enforces"]:
+            continue
+        name = re.search(r"def\s+(\w+)", lines[d])
+        label = f"{m.group(1)}.{m.group(2)} ({name.group(1) if name else 'hook'})"
+        app_wide = m.group(2) == "before_app_request" or m.group(1) in flask_apps
+        for t in tokens:
+            found.append((m.group(1), app_wide, dict(t, name=label, via="before_request",
+                                                     file=rel, line=d + 1)))
+    return found
+
+
 def parse_python(rel: str, lines: list, routers: dict = None) -> list:
     routers = routers or {}
     out = []
+    hooks = py_before_request(rel, lines)
     for i, raw in enumerate(lines):
         line = strip_comment(raw)
         methods, path, rest = None, None, ""
@@ -785,7 +824,8 @@ def parse_python(rel: str, lines: list, routers: dict = None) -> list:
         path = (info["prefix"].rstrip("/") + "/" + path.lstrip("/")) if info["prefix"] else path
         # decorators stack above the def, and extra args may wrap to later lines
         window = "\n".join(l for _, l in [(j, lines[j]) for j in range(i, min(len(lines), i + 6))])
-        guards = list(info["guards"]) + guard_tokens(window.split("def ")[0], rel, i + 1, "decorator")
+        guards = list(info["guards"]) + [g for o, wide, g in hooks if o == obj and not wide]
+        guards += guard_tokens(window.split("def ")[0], rel, i + 1, "decorator")
         for j in range(max(0, i - 6), i):
             if lines[j].lstrip().startswith("@"):
                 guards += guard_tokens(lines[j], rel, j + 1, "decorator")
@@ -1030,6 +1070,15 @@ def build(root: str) -> dict:
             if found:
                 frameworks.add("laravel")
                 routes += found
+
+    # a Flask app-wide before_request covers every route, including other files' blueprints
+    app_wide = [g for rel, _f, lines in files if rel.endswith(".py")
+                for o, wide, g in py_before_request(rel, lines) if wide]
+    if app_wide:
+        for r in routes:
+            if r["kind"] == "python":
+                have = {(g["name"], g["file"], g["line"]) for g in r["guards"]}
+                r["guards"] = [g for g in app_wide if (g["name"], g["file"], g["line"]) not in have] + r["guards"]
 
     # guards declared where a router is mounted apply to everything inside it
     prefix_guards = []
