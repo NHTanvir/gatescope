@@ -177,6 +177,50 @@ class TestDiscovery(Base):
         self.assertEqual(r["level"], "role")
         self.assertIn("admin", r["roles"])
 
+    def test_named_handler_does_not_borrow_the_next_routes_body(self):
+        got = self.by_label({"a.js": (
+            "app.put('/p/:id', requireAuth, updateProject);\n"
+            "app.delete('/p/:id', requireAuth, async (req, res) => {\n"
+            "  await db.project.deleteMany({ where: { id: req.params.id, userId: req.user.id } });\n"
+            "});\n"
+        )})
+        # the PUT's handler is elsewhere: its owner check is unknown, not borrowed
+        self.assertEqual(got["PUT /p/:id"]["level"], "authed")
+        self.assertEqual(got["DELETE /p/:id"]["level"], "owner")
+
+    def test_named_handler_on_a_wrapped_call(self):
+        got = self.by_label({"a.js": (
+            "app.put('/p/:id',\n  requireAuth,\n  updateProject);\n"
+            "app.delete('/q/:id', requireAuth, async (req, res) => {\n"
+            "  await db.p.deleteMany({ where: { id: req.params.id, userId: req.user.id } });\n"
+            "});\n"
+        )})
+        self.assertEqual(got["PUT /p/:id"]["level"], "authed")
+        self.assertEqual(got["DELETE /q/:id"]["level"], "owner")
+
+    def test_unscoped_named_handler_is_reported_as_an_idor(self):
+        self.assertIn("id_param_no_owner_check", self.rules({"a.js": (
+            "app.patch('/p/:id', requireAuth, updateProject);\n"
+            "app.delete('/p/:id', requireAuth, async (req, res) => {\n"
+            "  await db.project.deleteMany({ where: { id: req.params.id, userId: req.user.id } });\n"
+            "});\n"
+        )}))
+
+    def test_arrow_handler_without_braces_is_still_read(self):
+        r = self.one({"a.js": "app.get('/h', requireAuth, (req, res) =>\n  res.json({ ok: true }));\n"})
+        self.assertEqual(r["level"], "authed")
+
+    def test_next_exported_handler_alias_has_no_body_to_borrow(self):
+        got = self.by_label({"app/api/x/route.ts": (
+            "export const POST = handler;\n"
+            "export async function DELETE(req: Request) {\n"
+            "  const session = await auth();\n"
+            "  if (!session) return new Response('x', { status: 401 });\n"
+            "  await db.t.delete({ where: { userId: session.user.id } });\n}\n"
+        )})
+        self.assertEqual(got["POST /api/x"]["level"], "public")
+        self.assertEqual(got["DELETE /api/x"]["level"], "owner")
+
     def test_laravel_group_ends_at_its_closing_brace(self):
         got = self.by_label({
             "routes/api.php": (
