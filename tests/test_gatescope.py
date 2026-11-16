@@ -375,6 +375,38 @@ class TestDiscovery(Base):
 # --------------------------------------------------------------------------
 
 class TestGuards(Base):
+    def test_common_guard_names_are_recognised(self):
+        for name in ("auth", "isLoggedIn", "ensureAuthenticated", "ensureAuth", "isAuth",
+                     "verifyUser", "checkJwt", "jwtAuth", "requireUser", "validateToken",
+                     "requireLogin", "is_logged_in", "ensure_logged_in", "authenticateUser"):
+            with self.subTest(name):
+                r = self.one({"api.js": f"app.post('/x', {name}, async (req, res) => {{ await db.t.create({{}}); }});\n"})
+                self.assertEqual(r["level"], "authed")
+
+    def test_names_that_merely_contain_auth_are_not_guards(self):
+        for name in ("authController.register", "auth.login", "authService.create",
+                     "validateBody(schema)", "author", "oauthCallback", "unauthorized",
+                     "setAuthCookie"):
+            with self.subTest(name):
+                r = self.one({"api.js": f"app.post('/x', {name}, async (req, res) => {{ await db.t.create({{}}); }});\n"})
+                self.assertEqual(r["level"], "public")
+
+    def test_a_guard_name_in_a_handler_body_is_not_a_guard(self):
+        r = self.one({"api.js": (
+            "app.post('/x', async (req, res) => {\n"
+            "  const auth = require('./auth');\n  await db.t.create({});\n});\n")})
+        self.assertEqual(r["level"], "public")
+
+    def test_fastapi_get_current_active_user_is_a_guard(self):
+        r = self.one({"m.py": "@router.post('/x')\ndef f(user=Depends(get_current_active_user)):\n    db.add(1)\n"})
+        self.assertEqual(r["level"], "authed")
+
+    def test_a_guarded_api_with_camelcase_guards_has_no_critical(self):
+        rules = self.rules({"api.js": (
+            "app.post('/a', ensureAuthenticated, h);\napp.delete('/a/b', isLoggedIn, h);\n")})
+        self.assertNotIn("unauthenticated_mutation", rules)
+        self.assertNotIn("no_identity_guard_anywhere", rules)
+
     def test_role_guard_beats_identity_guard(self):
         r = self.one({
             "api.js": "app.get('/x', requireAuth, requireRole('admin'), h);\n",
