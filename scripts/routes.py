@@ -499,6 +499,13 @@ def _call_head(lines: list, i: int, rest: str) -> str:
     return text.split("{", 1)[0]
 
 
+RE_ROUTE_CHAIN = re.compile(
+    r"\b(\w+)\s*\.\s*route\s*\(\s*[`'\"]([^`'\"]*)[`'\"]\s*\)", re.I
+)
+RE_CHAIN_VERB = re.compile(r"\.\s*(" + "|".join(METHODS) + r")\s*\(", re.I)
+NOT_ROUTERS = {"axios", "fetch", "http", "https", "client", "api", "supertest", "request"}
+
+
 def parse_express(rel: str, lines: list, prefix: str = "") -> list:
     """Routes plus file-level middleware. Chains are resolved within the file."""
     uses = []
@@ -512,32 +519,55 @@ def parse_express(rel: str, lines: list, prefix: str = "") -> list:
                 uses.append((upath, toks))
 
     out = []
+
+    def emit(method: str, path: str, rest: str, at: int, handler_hint: str = "") -> None:
+        guards = guard_tokens(rest, rel, at + 1, "inline")
+        here = (prefix.rstrip("/") + path) if prefix else path
+        for upfx, toks in uses:
+            if not upfx or here.startswith(upfx.rstrip("/")) or path.startswith(upfx.rstrip("/")):
+                guards = toks + guards
+        handler = handler_hint
+        if not handler:
+            hm = re.search(r",\s*(\w+)\s*\)\s*;?\s*$", rest)
+            if hm:
+                handler = hm.group(1)
+        r = route(method, here, rel, at + 1, handler, guards, "express")
+        if RATE_LIMIT.search(rest):
+            r["rate_limited"] = True
+        inspect_body(r, body_of(lines, at))
+        out.append(r)
+
     for i, raw in enumerate(lines):
         line = strip_comment(raw)
+
+        # router.route('/items').get(requireAuth, list).post(requireAuth, create)
+        cm = RE_ROUTE_CHAIN.search(line)
+        if cm and cm.group(1).lower() not in NOT_ROUTERS and cm.group(2).startswith("/"):
+            stmt_lines, j = [line[cm.end():]], i
+            # the statement runs until its brackets balance and nothing chains on
+            bal = sum(t.count("(") + t.count("{") - t.count(")") - t.count("}") for t in stmt_lines)
+            while j + 1 < min(len(lines), i + 120):
+                nxt = strip_comment(lines[j + 1])
+                done = bal <= 0 and (stmt_lines[-1].rstrip().endswith(";") or not nxt.lstrip().startswith("."))
+                if done and stmt_lines[-1].strip():
+                    break
+                j += 1
+                stmt_lines.append(nxt)
+                bal += nxt.count("(") + nxt.count("{") - nxt.count(")") - nxt.count("}")
+            chain = "\n".join(stmt_lines)
+            for vm in RE_CHAIN_VERB.finditer(chain):
+                args = _call_args(chain, vm.end() - 1)
+                at = i + chain[: vm.start()].count("\n")
+                emit(vm.group(1), cm.group(2), args.split("{", 1)[0], at)
+            continue
+
         m = RE_EXPRESS.search(line)
         if not m:
             continue
         obj, method, path, rest = m.group(1), m.group(2), m.group(3), m.group(4)
-        if obj.lower() in {"axios", "fetch", "http", "https", "client", "api", "supertest", "request"}:
+        if obj.lower() in NOT_ROUTERS or not path.startswith("/"):
             continue
-        if not path.startswith("/"):
-            continue
-        rest = _call_head(lines, i, rest)
-        guards = guard_tokens(rest, rel, i + 1, "inline")
-        for upfx, toks in uses:
-            here = (prefix.rstrip("/") + path) if prefix else path
-            if not upfx or here.startswith(upfx.rstrip("/")) or path.startswith(upfx.rstrip("/")):
-                guards = toks + guards
-        handler = ""
-        hm = re.search(r",\s*(\w+)\s*\)\s*;?\s*$", rest)
-        if hm:
-            handler = hm.group(1)
-        full = (prefix.rstrip("/") + path) if prefix else path
-        r = route(method, full, rel, i + 1, handler, guards, "express")
-        if RATE_LIMIT.search(rest):
-            r["rate_limited"] = True
-        inspect_body(r, body_of(lines, i))
-        out.append(r)
+        emit(method, path, _call_head(lines, i, rest), i)
     return out
 
 
