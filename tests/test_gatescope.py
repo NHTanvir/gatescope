@@ -457,7 +457,7 @@ class TestGuards(Base):
         self.assertEqual(ignored["level"], "authed")
 
     def test_guards_on_a_wrapped_route_call_are_route_guards(self):
-        for name, src, want in {
+        for name, (src, want) in {
             "named handler": ("app.put('/p/:id',\n  requireAuth,\n  updateProject);\n", "authed"),
             "inline handler on its own line": ("app.post('/p',\n  requireAuth,\n  async (req, res) => {\n"
                                                "    await db.p.create({});\n  });\n", "authed"),
