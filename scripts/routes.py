@@ -182,15 +182,21 @@ def strip_comment(line: str) -> str:
 def body_of(lines: list, start: int, limit: int = 120) -> list:
     """Lines of the handler that begins at or just after `start`."""
     depth = 0
+    parens = 0
     seen_open = False
     out = []
     for i in range(start, min(len(lines), start + limit)):
-        line = lines[i]
-        out.append((i, line))
+        line = strip_comment(lines[i])
+        out.append((i, lines[i]))
         depth += line.count("{") - line.count("}")
+        parens += line.count("(") - line.count(")")
         if "{" in line:
             seen_open = True
         if seen_open and depth <= 0 and i > start:
+            break
+        # `app.put(path, guard, namedHandler);` has no inline body. Reading on would
+        # borrow the next route's handler and credit its checks to this one.
+        if not seen_open and parens <= 0:
             break
     return out
 
