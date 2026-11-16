@@ -125,7 +125,7 @@ production code without being a scan of production.
 | Next.js App Router | `app/**/route.ts` exports | `auth()` / `getServerSession()` in the handler |
 | Next.js server actions | exported functions in a `"use server"` file | the identity check inside the action |
 | FastAPI | `@app.get`, `@router.post` | decorators, `Depends(...)`, and the `prefix` and `dependencies` of `APIRouter`, `include_router` and `FastAPI(...)`, across files |
-| Flask | `@app.route(..., methods=[…])` | decorators such as `@login_required`, and `Blueprint` / `register_blueprint` URL prefixes |
+| Flask | `@app.route(..., methods=[…])` | decorators such as `@login_required`, `before_request` hooks, and `Blueprint` / `register_blueprint` URL prefixes |
 | Laravel | `Route::get`, `Route::resource` | `->middleware('auth')`, `Route::middleware([...])->group` |
 
 Router mounts are resolved across files: a route written as `/:id` in
@@ -204,8 +204,10 @@ Known limits, stated rather than hidden:
 - `owner` requires the query to be constrained by a session value. An ownership
   check done in application code after the fetch is not recognised, and will
   read as `authed`.
-- A guard that Flask applies with `@bp.before_request`, or that Django applies as
-  middleware, is not followed, so those routes read as `public` unless a decorator says otherwise.
+- Django is not supported: `urls.py` routes are not read at all.
+- A Flask `before_request` hook is followed only when its body enforces something (a 401/403,
+  or a throw or abort after a negative identity check). Endpoints it exempts, such as a login
+  page, are invisible, so the hook is credited to those routes too.
 - It never sends a request anywhere, so it cannot confirm that a guard works —
   only that one is there.
 
