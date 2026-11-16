@@ -504,6 +504,52 @@ class TestDiscovery(Base):
         py = self.by_label({"m.py": "# @app.post('/old')\n@app.get('/ok')\ndef ok():\n    return 1  # fine\n"})
         self.assertEqual(sorted(py), ["GET /ok"])
 
+    HOOK = ("@bp.before_request\ndef require_login():\n"
+            "    if not current_user.is_authenticated:\n        abort(401)\n\n")
+
+    def test_flask_blueprint_before_request_guards_its_routes(self):
+        r = self.one({"m.py": (
+            "bp = Blueprint('a', __name__, url_prefix='/admin')\n\n" + self.HOOK
+            + "@bp.route('/users', methods=['POST'])\ndef add():\n    db.add(1)\n")})
+        self.assertEqual((r["path"], r["level"]), ("/admin/users", "authed"))
+
+    def test_a_before_request_hook_that_only_logs_guards_nothing(self):
+        r = self.one({"m.py": (
+            "bp = Blueprint('a', __name__)\n\n@bp.before_request\ndef log_it():\n"
+            "    logger.info('hit')\n\n@bp.route('/x', methods=['POST'])\ndef add():\n    db.add(1)\n")})
+        self.assertEqual(r["level"], "public")
+
+    def test_a_blueprint_hook_does_not_cover_another_blueprint(self):
+        got = self.by_label({"m.py": (
+            "bp = Blueprint('a', __name__)\nother = Blueprint('b', __name__)\n\n" + self.HOOK
+            + "@bp.route('/x', methods=['POST'])\ndef a():\n    db.add(1)\n\n"
+              "@other.route('/y', methods=['POST'])\ndef b():\n    db.add(1)\n")})
+        self.assertEqual(got["POST /x"]["level"], "authed")
+        self.assertEqual(got["POST /y"]["level"], "public")
+
+    def test_an_app_wide_hook_covers_blueprints_in_other_files(self):
+        r = self.one({
+            "app.py": ("app = Flask(__name__)\n\n@app.before_request\ndef check_access():\n"
+                       "    if not session.get('user'):\n        return redirect('/login')\n"),
+            "views.py": ("bp = Blueprint('v', __name__)\n\n@bp.route('/x', methods=['POST'])\n"
+                         "def add():\n    db.add(1)\n"),
+        })
+        self.assertEqual(r["level"], "authed")
+
+    def test_before_app_request_is_app_wide(self):
+        r = self.one({"m.py": (
+            "bp = Blueprint('a', __name__)\n\n@bp.before_app_request\ndef check_access():\n"
+            "    if current_user is None:\n        abort(403)\n\n"
+            "@bp.route('/x', methods=['POST'])\ndef add():\n    db.add(1)\n")})
+        self.assertEqual(r["level"], "authed")
+
+    def test_a_role_check_in_before_request_makes_the_blueprint_role_gated(self):
+        r = self.one({"m.py": (
+            "bp = Blueprint('a', __name__, url_prefix='/admin')\n\n@bp.before_request\n"
+            "def gate():\n    if not current_user.is_admin:\n        abort(403)\n\n"
+            "@bp.route('/x', methods=['POST'])\ndef add():\n    db.add(1)\n")})
+        self.assertEqual(r["level"], "role")
+
     def test_comment_is_not_a_route(self):
         doc = self.build({"api.js": "// app.get('/old', handler);\n"})
         self.assertEqual(doc["route_count"], 0)
