@@ -412,6 +412,78 @@ class TestDiscovery(Base):
     def test_a_http_client_route_call_is_not_a_router(self):
         self.assertEqual(self.build({"a.js": "supertest.route('/x').get(y);\n"})["route_count"], 0)
 
+    def test_fastapi_router_prefix_and_dependencies(self):
+        got = self.by_label({"m.py": (
+            "from fastapi import APIRouter, Depends\n"
+            "router = APIRouter(prefix='/items', dependencies=[Depends(get_current_user)])\n\n"
+            "@router.post('/')\ndef create(payload: dict):\n    db.add(payload)\n\n"
+            "@router.get('/{item_id}')\ndef read(item_id: int):\n    return 1\n")})
+        self.assertEqual(got["POST /items"]["level"], "authed")
+        self.assertEqual(got["GET /items/{item_id}"]["level"], "authed")
+
+    def test_fastapi_empty_route_path_under_a_prefix(self):
+        got = self.by_label({"m.py": (
+            "router = APIRouter(prefix='/items')\n\n@router.get('')\ndef lst():\n    return 1\n")})
+        self.assertIn("GET /items", got)
+
+    def test_fastapi_include_router_across_files(self):
+        got = self.by_label({
+            "app/main.py": ("from fastapi import FastAPI, Depends\nfrom app.routers import items\n"
+                            "app = FastAPI()\n"
+                            "app.include_router(items.router, prefix='/api', "
+                            "dependencies=[Depends(verify_token)])\n"),
+            "app/routers/items.py": ("from fastapi import APIRouter\nrouter = APIRouter(prefix='/items')\n\n"
+                                     "@router.delete('/{i}')\ndef rm(i: int):\n    db.delete(i)\n"),
+        })
+        self.assertEqual(got["DELETE /api/items/{i}"]["level"], "authed")
+
+    def test_fastapi_include_router_through_an_aliased_import(self):
+        got = self.by_label({
+            "app/main.py": ("from app.routers.items import router as items_router\n"
+                            "app = FastAPI()\napp.include_router(items_router, prefix='/v1')\n"),
+            "app/routers/items.py": "router = APIRouter()\n\n@router.get('/x')\ndef x():\n    return 1\n",
+        })
+        self.assertIn("GET /v1/x", got)
+
+    def test_fastapi_app_level_dependencies(self):
+        r = self.one({"m.py": (
+            "app = FastAPI(dependencies=[Depends(verify_token)])\n\n"
+            "@app.post('/x')\ndef x():\n    db.add(1)\n")})
+        self.assertEqual(r["level"], "authed")
+
+    def test_fastapi_nested_routers_chain_their_prefixes_and_guards(self):
+        r = self.one({"m.py": (
+            "api = APIRouter(prefix='/api', dependencies=[Depends(get_current_user)])\n"
+            "items = APIRouter(prefix='/items')\napi.include_router(items)\n"
+            "app = FastAPI()\napp.include_router(api)\n\n"
+            "@items.post('/')\ndef c():\n    db.add(1)\n")})
+        self.assertEqual((r["path"], r["level"]), ("/api/items", "authed"))
+
+    def test_flask_blueprint_prefix_makes_an_admin_path_visible(self):
+        files = {"m.py": (
+            "bp = Blueprint('admin', __name__, url_prefix='/admin')\n\n"
+            "@bp.route('/users', methods=['POST'])\n@login_required\ndef add():\n    db.add(1)\n")}
+        self.assertEqual(self.one(files)["path"], "/admin/users")
+        self.assertIn("admin_path_without_role_guard", self.rules(files))
+
+    def test_flask_register_blueprint_prefix_wins(self):
+        got = self.by_label({
+            "app.py": ("from admin import bp\napp = Flask(__name__)\n"
+                       "app.register_blueprint(bp, url_prefix='/staff')\n"),
+            "admin.py": ("bp = Blueprint('admin', __name__, url_prefix='/admin')\n\n"
+                         "@bp.route('/users')\ndef u():\n    return 1\n"),
+        })
+        self.assertIn("GET /staff/users", got)
+
+    def test_routers_with_the_same_name_in_different_files_are_not_mixed(self):
+        got = self.by_label({
+            "a.py": ("router = APIRouter(prefix='/a', dependencies=[Depends(get_current_user)])\n\n"
+                     "@router.post('/x')\ndef x():\n    db.add(1)\n"),
+            "b.py": "router = APIRouter(prefix='/b')\n\n@router.post('/y')\ndef y():\n    db.add(1)\n",
+        })
+        self.assertEqual(got["POST /a/x"]["level"], "authed")
+        self.assertEqual(got["POST /b/y"]["level"], "public")
+
     def test_comment_is_not_a_route(self):
         doc = self.build({"api.js": "// app.get('/old', handler);\n"})
         self.assertEqual(doc["route_count"], 0)

@@ -631,25 +631,154 @@ RE_FLASK = re.compile(
 )
 
 
-def parse_python(rel: str, lines: list) -> list:
+RE_PY_ROUTER_DEF = re.compile(
+    r"^[ \t]*(\w+)\s*=\s*(?:[\w.]+\.)?(APIRouter|Blueprint|FastAPI)\s*\(", re.M
+)
+RE_PY_INCLUDE = re.compile(r"\b(\w+)\s*\.\s*(include_router|register_blueprint)\s*\(")
+RE_PY_FROM = re.compile(r"^[ \t]*from\s+([\w.]+)\s+import\s+([^\n(]+|\([^)]*\))", re.M)
+RE_PY_IMPORT = re.compile(r"^[ \t]*import\s+([\w.]+)(?:\s+as\s+(\w+))?", re.M)
+
+
+def _py_call(text: str, open_idx: int) -> str:
+    return _call_args(text, open_idx)
+
+
+def _kwarg(args: str, *names: str) -> str:
+    for name in names:
+        m = re.search(r"\b" + name + r"\s*=\s*['\"]([^'\"]*)['\"]", args)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _kw_guards(args: str, file: str, line: int, via: str) -> list:
+    m = re.search(r"\bdependencies\s*=\s*\[(.*)\]", args, re.S)
+    return guard_tokens(m.group(1), file, line, via) if m else []
+
+
+def _dotted(rel: str) -> str:
+    return os.path.splitext(rel)[0].replace("/", ".").removesuffix(".__init__")
+
+
+def _py_module_file(spec: str, files_by_dotted: dict) -> str:
+    """app.routers.items -> app/routers/items.py, matching on the dotted tail."""
+    spec = spec.lstrip(".")
+    if not spec:
+        return ""
+    for dotted, rel in files_by_dotted.items():
+        if dotted == spec or dotted.endswith("." + spec):
+            return rel
+    return ""
+
+
+def py_router_map(files: list) -> dict:
+    """{file: {router variable: {"prefix", "guards"}}} with includes applied.
+
+    A FastAPI or Flask route's real path and guards are declared where its
+    router is created (APIRouter(prefix=..., dependencies=[...]), Blueprint(
+    url_prefix=...)) and where it is included (include_router(..., prefix=...,
+    dependencies=[...]), register_blueprint(..., url_prefix=...)), which is
+    usually another file.
+    """
+    py = [(rel, lines) for rel, _f, lines in files if rel.endswith(".py")]
+    by_dotted = {_dotted(rel): rel for rel, _l in py}
+    defs: dict = {}      # (file, var) -> {"kind", "prefix", "guards"}
+    incs: list = []      # (includer (file, var), target (file, var), prefix, guards, kind)
+    for rel, lines in py:
+        text = "\n".join(strip_comment(l) for l in lines)
+        for m in RE_PY_ROUTER_DEF.finditer(text):
+            args = _py_call(text, m.end() - 1)
+            line = text[: m.start()].count("\n") + 1
+            kind = m.group(2)
+            defs[(rel, m.group(1))] = {
+                "kind": kind,
+                "prefix": _kwarg(args, "prefix", "url_prefix") if kind != "FastAPI" else "",
+                "guards": _kw_guards(args, rel, line, "router-dependencies"),
+            }
+        # imports: alias -> (module spec, original name or None)
+        imported: dict = {}
+        for m in RE_PY_FROM.finditer(text):
+            for part in re.split(r"[,\n]", m.group(2).strip("() \n")):
+                part = part.strip()
+                if not part:
+                    continue
+                name, _, alias = part.partition(" as ")
+                imported[(alias or name).strip()] = (m.group(1), name.strip())
+        for m in RE_PY_IMPORT.finditer(text):
+            imported[m.group(2) or m.group(1).split(".")[-1]] = (m.group(1), None)
+        for m in RE_PY_INCLUDE.finditer(text):
+            args = _py_call(text, m.end() - 1)
+            first = re.match(r"\s*([\w.]+)", args)
+            if not first:
+                continue
+            expr, line = first.group(1), text[: m.start()].count("\n") + 1
+            target = None
+            if "." in expr:
+                head, var = expr.rsplit(".", 1)
+                mod = imported.get(head.split(".")[0])
+                if mod:
+                    spec = mod[0] if mod[1] is None else mod[0] + "." + mod[1]
+                    f = _py_module_file(spec, by_dotted)
+                    target = (f, var) if f else None
+            elif (rel, expr) in defs:
+                target = (rel, expr)
+            elif expr in imported:
+                spec, orig = imported[expr]
+                f = _py_module_file(spec, by_dotted)
+                target = (f, orig or expr) if f else None
+            if target:
+                incs.append(((rel, m.group(1)), target, args, line, m.group(2)))
+
+    # final prefix and guards: walk the include chain up to the app
+    parent = {t: (inc, args, line, kind) for inc, t, args, line, kind in incs}
+
+    def resolve(key, depth=0):
+        d = defs.get(key)
+        own_prefix = d["prefix"] if d else ""
+        guards = list(d["guards"]) if d else []
+        if key not in parent or depth > 6:
+            return own_prefix, guards
+        inc, args, line, kind = parent[key]
+        outer_prefix, outer_guards = resolve(inc, depth + 1)
+        given = _kwarg(args, "prefix", "url_prefix")
+        if kind == "register_blueprint":
+            own_prefix = given or own_prefix          # url_prefix at register wins
+            inner = own_prefix
+        else:
+            inner = given + own_prefix                # FastAPI: include prefix, then the router's
+        guards = outer_guards + _kw_guards(args, key[0], line, "router-dependencies") + guards
+        return (outer_prefix + inner), guards
+
+    out: dict = {}
+    for key in defs:
+        prefix, guards = resolve(key)
+        out.setdefault(key[0], {})[key[1]] = {"prefix": prefix, "guards": guards}
+    return out
+
+
+def parse_python(rel: str, lines: list, routers: dict = None) -> list:
+    routers = routers or {}
     out = []
     for i, raw in enumerate(lines):
         line = strip_comment(raw)
         methods, path, rest = None, None, ""
+        obj = None
         m = RE_FASTAPI.search(line)
         if m:
-            methods, path, rest = [m.group(2)], m.group(3), m.group(4)
+            obj, methods, path, rest = m.group(1), [m.group(2)], m.group(3), m.group(4)
         else:
             m = RE_FLASK.search(line)
             if m:
-                path, rest = m.group(2), m.group(3)
+                obj, path, rest = m.group(1), m.group(2), m.group(3)
                 found = re.findall(r"['\"](GET|POST|PUT|PATCH|DELETE)['\"]", rest, re.I)
                 methods = found or ["GET"]
-        if not path or not path.startswith("/"):
+        info = routers.get(obj or "", {"prefix": "", "guards": []})
+        if path is None or not (path.startswith("/") or (path == "" and info["prefix"])):
             continue
+        path = (info["prefix"].rstrip("/") + "/" + path.lstrip("/")) if info["prefix"] else path
         # decorators stack above the def, and extra args may wrap to later lines
         window = "\n".join(l for _, l in [(j, lines[j]) for j in range(i, min(len(lines), i + 6))])
-        guards = guard_tokens(window.split("def ")[0], rel, i + 1, "decorator")
+        guards = list(info["guards"]) + guard_tokens(window.split("def ")[0], rel, i + 1, "decorator")
         for j in range(max(0, i - 6), i):
             if lines[j].lstrip().startswith("@"):
                 guards += guard_tokens(lines[j], rel, j + 1, "decorator")
@@ -869,6 +998,7 @@ def parse_php(rel: str, lines: list) -> list:
 def build(root: str) -> dict:
     files = walk(root)
     mounts = mount_map(files)
+    py_routers = py_router_map(files)
     routes, frameworks = [], set()
     for rel, _full, lines in files:
         ext = os.path.splitext(rel)[1].lower()
@@ -884,7 +1014,7 @@ def build(root: str) -> dict:
                 frameworks.add("express")
                 routes += found
         elif ext in PY_EXT:
-            found = parse_python(rel, lines)
+            found = parse_python(rel, lines, py_routers.get(rel, {}))
             if found:
                 frameworks.add("fastapi/flask")
                 routes += found
