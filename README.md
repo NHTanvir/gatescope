@@ -58,7 +58,7 @@ The same API with identity on the router and ownership in the query drops to
 **0 findings** — the full before/after is in
 [`examples/project-api/`](examples/project-api).
 
-![license](https://img.shields.io/badge/license-MIT-blue) ![python](https://img.shields.io/badge/python-3.9%2B-blue) ![deps](https://img.shields.io/badge/dependencies-none-success) ![tests](https://img.shields.io/badge/tests-60%20passing-success)
+![license](https://img.shields.io/badge/license-MIT-blue) ![python](https://img.shields.io/badge/python-3.9%2B-blue) ![deps](https://img.shields.io/badge/dependencies-none-success) ![tests](https://img.shields.io/badge/tests-114%20passing-success)
 
 ---
 
