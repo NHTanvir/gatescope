@@ -386,16 +386,31 @@ CALLER_IDENTITY = re.compile(
 )
 
 
+# Saying "no" about identity, unmistakably: a status code or a message.
 ENFORCE = re.compile(
-    r"\b401\b|\b403\b|unauthorised|unauthorized|forbidden|\bthrow\b|"
-    r"\bredirect\s*\(|\babort\s*\(|\bnotFound\s*\(|HTTPException|"
-    r"\bdeny\b|\breject\b", re.I
+    r"\b401\b|\b403\b|unauthori[sz]ed|unauthenticated|forbidden|not_?logged_?in|"
+    r"login_?required", re.I
+)
+# A bare throw, redirect or abort says "no" about something. It is an identity check
+# only when it follows a negative test of the session or the user.
+ENFORCE_WEAK = re.compile(
+    r"\bthrow\b|\braise\b|\bredirect\s*\(|\babort\s*\(|\bnotFound\s*\(|"
+    r"HTTPException|\bdeny\b|\breject\b", re.I
+)
+_NOT_REQUEST = r"(?!(?:req|request)\.(?:body|query|params|headers)\b|body\b|params\b|query\b|input\b|data\b)"
+NEG_IDENTITY = re.compile(
+    r"!\s*\(?\s*(?:await\s+)?" + _NOT_REQUEST
+    + r"[\w.$?()]*?(?:session|user|auth|identity|principal|viewer)\w*|"
+    r"\b(?:session|user|auth\w*|currentUser|identity)\s*(?:===?|==)\s*(?:null|undefined|None)\b|"
+    r"\b(?:session|user|auth\w*|current_?user|identity)\s+is\s+None\b|"
+    r"\bnot\s+" + _NOT_REQUEST + r"[\w.]*?(?:session|user|auth\w*|identity)\w*", re.I
 )
 
 
 def inspect_body(r: dict, body: list) -> None:
     """Read the handler for ownership checks, mass assignment and ordering."""
     first_write, first_identity = None, None
+    last_negation = None
     if body:
         sig = " ".join(l for _, l in body[:3])
         if CALLER_IDENTITY.search(sig.split("{", 1)[0] if "{" in sig else sig):
@@ -406,7 +421,11 @@ def inspect_body(r: dict, body: list) -> None:
             continue
         if SESSION_SOURCE.search(line):
             r["session_source"] = True
-        if ENFORCE.search(line):
+        if NEG_IDENTITY.search(line):
+            last_negation = i
+        if ENFORCE.search(line) or (
+            ENFORCE_WEAK.search(line) and last_negation is not None and i - last_negation <= 3
+        ):
             r["enforces"] = True
         if _owner_check(line):
             r["owner_check"] = True
@@ -432,6 +451,9 @@ def inspect_body(r: dict, body: list) -> None:
                 r["guards"] += guard_tokens(line, r["file"], i + 1, "body")
         elif ROLE.search(line):
             r["guards"] += guard_tokens(line, r["file"], i + 1, "body")
+    if not r["enforces"]:
+        # a session or role that is looked up and never acted on guards nothing
+        r["guards"] = [g for g in r["guards"] if g.get("via") != "body"]
     if first_write is not None and first_identity is not None and first_identity > first_write:
         r["guard_after_write"] = True
         r["guard_order_evidence"] = {
@@ -453,6 +475,28 @@ RE_EXPRESS = re.compile(
 RE_USE = re.compile(
     r"\b(\w+)\s*\.\s*use\s*\(\s*(?:[`'\"]([^`'\"]*)[`'\"]\s*,)?\s*(.*)$", re.I
 )
+
+
+def _call_head(lines: list, i: int, rest: str) -> str:
+    """The arguments of a route call up to its handler body, across wrapped lines.
+
+    app.post('/x',
+      requireAuth,
+      async (req, res) => {
+
+    The guard on the second line belongs to the route's chain, exactly as it
+    would on one line. Reading only the first line left it to be found later as a
+    guard inside the handler body, which is a different claim.
+    """
+    text = rest
+    parens = text.count("(") - text.count(")") + 1  # the route call's own "("
+    j = i
+    while "{" not in text and parens > 0 and j < min(len(lines) - 1, i + 6):
+        j += 1
+        nxt = strip_comment(lines[j])
+        text += " " + nxt
+        parens += nxt.count("(") - nxt.count(")")
+    return text.split("{", 1)[0]
 
 
 def parse_express(rel: str, lines: list, prefix: str = "") -> list:
@@ -478,6 +522,7 @@ def parse_express(rel: str, lines: list, prefix: str = "") -> list:
             continue
         if not path.startswith("/"):
             continue
+        rest = _call_head(lines, i, rest)
         guards = guard_tokens(rest, rel, i + 1, "inline")
         for upfx, toks in uses:
             here = (prefix.rstrip("/") + path) if prefix else path
