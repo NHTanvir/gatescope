@@ -407,6 +407,68 @@ class TestGuards(Base):
         self.assertNotIn("unauthenticated_mutation", rules)
         self.assertNotIn("no_identity_guard_anywhere", rules)
 
+    def test_optional_session_and_a_validation_throw_is_not_a_guard(self):
+        r = self.one({"api.js": (
+            "app.post('/comments', async (req, res) => {\n"
+            "  const who = req.user ? req.user.name : 'anon';\n"
+            "  if (!req.body.text) throw new Error('text required');\n"
+            "  await db.comment.create({ data: { text: req.body.text, who } });\n});\n")})
+        self.assertEqual(r["level"], "public")
+
+    def test_a_negated_request_field_is_not_an_identity_check(self):
+        r = self.one({"api.js": (
+            "app.post('/c', async (req, res) => {\n  const s = req.user;\n"
+            "  if (!req.body.user) throw new Error('bad');\n  await db.c.create({});\n});\n")})
+        self.assertEqual(r["level"], "public")
+
+    def test_a_throw_after_a_negative_identity_check_is_enforcement(self):
+        for name, files in {
+            "401": {"a.js": "app.post('/c', async (req, res) => {\n"
+                    "  const session = await getSession(req);\n"
+                    "  if (!session) return res.status(401).end();\n  await db.c.create({});\n});\n"},
+            "redirect": {"app/x/actions.ts": "'use server';\nexport async function a() {\n"
+                         "  const session = await auth();\n  if (!session) redirect('/login');\n"
+                         "  await db.t.create({});\n}\n"},
+            "throw": {"app/x/actions.ts": "'use server';\nexport async function a() {\n"
+                      "  const session = await auth();\n  if (!session?.user) throw new Error('nope');\n"
+                      "  await db.t.create({});\n}\n"},
+            "python is None": {"m.py": "@app.post('/x')\ndef f(request):\n    user = request.user\n"
+                               "    if user is None:\n        raise HTTPException(status_code=400)\n    db.add(1)\n"},
+            "python not current_user": {"m.py": "@app.route('/x', methods=['POST'])\ndef f():\n"
+                                        "    if not current_user:\n        abort(400)\n    db.add(1)\n"},
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(self.one(files)["level"], "authed")
+
+    def test_a_session_looked_up_and_never_acted_on_guards_nothing(self):
+        r = self.one({"api.js": (
+            "app.post('/c', async (req, res) => {\n  const session = await getSession(req);\n"
+            "  log(session);\n  await db.c.create({});\n});\n")})
+        self.assertEqual(r["level"], "public")
+
+    def test_a_role_check_in_the_body_counts_only_when_it_denies(self):
+        denies = self.one({"api.js": (
+            "app.post('/c', requireAuth, async (req, res) => {\n"
+            "  if (!isAdmin(req.user)) throw new Error('no');\n  await db.c.create({});\n});\n")})
+        self.assertEqual(denies["level"], "role")
+        ignored = self.one({"api.js": (
+            "app.post('/c', requireAuth, async (req, res) => {\n"
+            "  const ok = isAdmin(req.user);\n  await db.c.create({});\n});\n")})
+        self.assertEqual(ignored["level"], "authed")
+
+    def test_guards_on_a_wrapped_route_call_are_route_guards(self):
+        for name, (src, want) in {
+            "named handler": ("app.put('/p/:id',\n  requireAuth,\n  updateProject);\n", "authed"),
+            "inline handler on its own line": ("app.post('/p',\n  requireAuth,\n  async (req, res) => {\n"
+                                               "    await db.p.create({});\n  });\n", "authed"),
+            "role chain": ("app.post('/p',\n  requireAuth,\n  requireRole('admin'),\n  async (req, res) => {\n"
+                           "    await db.p.create({});\n  });\n", "role"),
+            "a guard-looking name inside the handler": ("app.post('/p',\n  async (req, res) => {\n"
+                                                        "    const requireAuth = 1;\n    await db.p.create({});\n  });\n", "public"),
+        }.items():
+            with self.subTest(name):
+                self.assertEqual(self.one({"api.js": src})["level"], want)
+
     def test_role_guard_beats_identity_guard(self):
         r = self.one({
             "api.js": "app.get('/x', requireAuth, requireRole('admin'), h);\n",
